@@ -10,6 +10,8 @@ miniredis::hashtable::hashtable (std::size_t n)
 
 bool miniredis::hashtable::initialise_hashtable (std::size_t n)
 {
+  std::lock_guard <std::mutex> lock(mutex);
+  
   if (n == 0 || ((n - 1) & n) != 0) { return false; }
 
   table.resize (n);
@@ -17,30 +19,60 @@ bool miniredis::hashtable::initialise_hashtable (std::size_t n)
   size = 0;
 }
 
-std::size_t miniredis::hashtable::get_size () const { return size; }
+std::size_t miniredis::hashtable::get_size () 
+{ 
+  std::lock_guard <std::mutex> lock (mutex);
+  return size; 
+}
 
-std::size_t miniredis::hashtable::get_mask () const { return mask; }
+std::mutex& miniredis::hashtable::get_mutex ()
+{
+  std::lock_guard <std::mutex> lock (mutex);
+  return mutex;
+}
 
-void miniredis::hashtable::set_size (std::size_t n) { size = n; }
+std::size_t miniredis::hashtable::get_mask () 
+{
+  std::lock_guard <std::mutex> lock (mutex); 
+  return mask; 
+}
 
-void miniredis::hashtable::set_mask (std::size_t n) { mask = n; }
+void miniredis::hashtable::set_size (std::size_t n) 
+{ 
+  std::lock_guard <std::mutex> lock (mutex);
+  size = n; 
+}
 
-void miniredis::hashtable::increment_size () { size++; }
+void miniredis::hashtable::set_mask (std::size_t n) 
+{ 
+  std::lock_guard <std::mutex> lock (mutex);
+  mask = n;
+}
 
-void miniredis::hashtable::decrement_size () { if (size > 0) { size--; } }
+void miniredis::hashtable::increment_size () 
+{ 
+  std::lock_guard <std::mutex> lock (mutex);
+  size++; 
+}
+
+void miniredis::hashtable::decrement_size () 
+{
+  std::lock_guard <std::mutex> lock (mutex);
+  if (size > 0) { size--; } 
+}
 
 void miniredis::hashtable::clear_segment (std::size_t start, std::size_t end)
 {
   for (std::size_t i = start ; i < end; ++i)
   {
+    std::lock_guard <std::mutex> lock (locks[i]);
+    
     if (table[i]) { table[i] = nullptr; }
   }
 }
 
 void miniredis::hashtable::clear ()
 {
-  std::lock_guard <std::mutex> lock (mutex);
-
   std::size_t num_threads = std::thread::hardware_concurrency ();
   std::size_t segment_size = table.size () / num_threads;
 
@@ -68,6 +100,7 @@ bool miniredis::hashtable::compare_nodes (const node_pointer& node, const node_p
 bool miniredis::hashtable::insert (node_pointer& node)
 {
   size_t pos = node->hashcode & mask;
+  std::lock_guard<std::mutex> lock(locks[pos]);
 
   if (pos >= size)
   {
@@ -88,11 +121,34 @@ bool miniredis::hashtable::remove (node_pointer& from)
     return false;
   }
 
-  node_pointer node = std::move (from);
-  from = std::move(node->next);
-  size--;
+  std::size_t pos = from->hashcode & mask;
+  std::lock_guard<std::mutex> lock (locks[pos]);
 
-  return true;
+  node* current = table[pos].get();
+  node* prev = nullptr;
+
+  while (current != nullptr)
+  {
+    if (compare_nodes (static_cast<node_pointer> (current), from))
+    {
+      if (prev == nullptr)
+      {
+        table[pos] = std::move (from->next);
+      }
+
+      else
+      {
+        prev->next = std::move (from->next);
+      }
+
+      size--;
+      return true;
+  }
+  prev = current;
+  current = std::move (current->next.get());
+  }
+  
+  return false;
 }
 
 miniredis::hashtable::node* miniredis::hashtable::find (const node_pointer& key)
@@ -100,6 +156,7 @@ miniredis::hashtable::node* miniredis::hashtable::find (const node_pointer& key)
   if (table.empty())
   {
     size_t pos = key->hashcode & mask;
+    std::lock_guard <std::mutex> lock (locks[pos]);
     node_pointer *from = &(table[pos]);
 
     while (*from)
@@ -126,10 +183,15 @@ miniredis::hashmap::hashmap () : main (default_size)
   initialise_main (default_size);
 }
 
-bool miniredis::hashmap::power_of_two (std::size_t n) { return (n == 0 || ((n - 1) & n) != 0); }
+bool miniredis::hashmap::power_of_two (std::size_t n) 
+{ 
+  std::lock_guard <std::mutex> lock (mutex);
+  return (n == 0 || ((n - 1) & n) != 0); 
+}
 
 bool miniredis::hashmap::initialise_main (std::size_t n)
 {
+  std::lock_guard <std::mutex> lock (mutex);
   if (power_of_two(n))
   {
     main.table.resize (n);
@@ -143,6 +205,9 @@ bool miniredis::hashmap::initialise_main (std::size_t n)
 
 bool miniredis::hashmap::insert (hashtable::node_pointer node)
 {
+  std::size_t pos = node->hashcode & main.get_mask ();
+  std::lock_guard <std::mutex> lock (main.locks[pos]);
+  
   if (!backup_table.get_size ())
   {
     //initialise it
@@ -162,31 +227,43 @@ bool miniredis::hashmap::insert (hashtable::node_pointer node)
   redistribute_to_backup ();
 }
 
-bool miniredis::hashmap::pop (hashtable::node_pointer& key)
+bool miniredis::hashmap::pop (hashtable::node_pointer& node)
 {
   redistribute_to_backup ();
-  hashtable::node* from = backup_table.find (key);
 
-  if (from) { return backup_table.remove (key);}
+  std::size_t pos = node->hashcode & main.get_mask ();
+  std::lock_guard <std::mutex> lock (main.locks[pos]);
   
-  from = main.find (key);
-  if (from)
+  hashtable::node* from_main = main.find (node);
+
+  if (from_main) { return main.remove (node);}
+
+  std::size_t backup_pos = node->hashcode & backup_table.get_mask();
+  std::lock_guard <std::mutex> lock (backup_table.locks[pos]);
+  
+  hashtable::node* from_backup = backup_table.find(node);
+
+  if (from_backup)
   {
-    return main.remove (key);
+    return backup_table.remove (node);
   }
 
   return false; //handle error
 }
 
-miniredis::hashtable::node* miniredis::hashmap::find (const hashtable::node_pointer& key)
+
+miniredis::hashtable::node* miniredis::hashmap::find (const hashtable::node_pointer& node)
 {
   redistribute_to_backup ();
-  //node_pointer *from = &(table[pos]);
-  hashtable::node* found_node = backup_table.find (key);
+
+  std::size_t pos = node->hashcode & main.get_mask ();
+  std::lock_guard <std::mutex> lock (main.locks[pos]);
+
+  hashtable::node* found_node = backup_table.find (node);
 
   if (!found_node)
   {
-    found_node = main.find (key);
+    found_node = main.find (node);
   }
 
   
@@ -207,6 +284,7 @@ void miniredis::hashmap::redistribute_segment (hashtable& source, hashtable& des
 {
   for (std::size_t pos = start; pos < end; ++pos)
   {
+    std::lock_guard <std::mutex> lock (source.locks[pos]);
     hashtable::node_pointer& from = source.table[pos];
 
     if (!from)
@@ -223,17 +301,17 @@ void miniredis::hashmap::redistribute_segment (hashtable& source, hashtable& des
 void miniredis::hashmap::parallel_redistribute (hashtable& source, hashtable& destination)
 {
   std::size_t num_threads = std::thread::hardware_concurrency ();
-  std::size_t segment_size = main.get_size () / num_threads;
+  std::size_t segment_size = source.get_size () / num_threads;
   
   std::vector <std::thread> threads;
 
   for (std::size_t i = 0; i < num_threads; ++i)
   {
-    threads.emplace_back ([this, i, segment_size]()
+    threads.emplace_back ([this, &source, &destination, i, segment_size]()
     {
       std::size_t start = i * segment_size;
       std::size_t end = (i + 1) * segment_size;
-      redistribute_segment (main, backup_table, start, end);
+      redistribute_segment (source, destination, start, end);
     });
   }
 
@@ -249,7 +327,11 @@ void miniredis::hashmap::redistribute_to_backup ()
 
   parallel_redistribute (main, backup_table);
 
-  if (main.get_size() == 0) { main.table.clear (); }
+  if (main.get_size() <= main.get_mask() * 0.25)
+  {
+    std::size_t new_size = main.get_mask () / 2;
+    adjust_size (new_size);
+  }
 }
 
 
@@ -265,6 +347,7 @@ void miniredis::hashmap::adjust_size (std::size_t new_size)
 {
   if ( power_of_two (new_size))
   {
+    std::lock_guard<std::mutex> lock(mutex);
     redistribute_to_backup();
     initialise_main (new_size);
     resize_main_table ();

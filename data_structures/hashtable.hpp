@@ -25,6 +25,7 @@ public:
 
   using node_pointer = std::unique_ptr <node>;
   std::vector <node_pointer> table;
+  std::vector <std::mutex> locks;
   
   hashtable (size_t n);
   hashtable (const hashtable&) = delete;
@@ -38,8 +39,8 @@ public:
   void set_mask(std::size_t n);
   void clear ();
   void clear_segment (std::size_t start, size_t end);
-  size_t get_size() const;
-  size_t get_mask() const;
+  size_t get_size();
+  size_t get_mask();
   bool insert (node_pointer& node);
   bool remove (node_pointer& node);
   node* find (const node_pointer& key);
@@ -82,6 +83,8 @@ private:
   const double max_fill_ratio = 0.75;
   
   hashtable main;
+  std::mutex mutex;
+  std::vector <std::mutex> locks;
   std::optional <hashtable> backup;
   hashtable& backup_table = backup.value ();
 
