@@ -1,52 +1,71 @@
 #include "hashtable.hpp"
 
-/*
-hashtable::hashtable (std::size_t n)
+
+
+
+miniredis::hashtable::hashtable (std::size_t n)
 {
   initialise_hashtable (n);
 }
 
-
-bool hashtable::initialise_hashtable (size_t n)
+bool miniredis::hashtable::initialise_hashtable (std::size_t n)
 {
-  if (n == 0 || ((n - 1) & n) != 0)
+  if (n == 0 || ((n - 1) & n) != 0) { return false; }
+
+  table.resize (n);
+  mask = n-1;
+  size = 0;
+}
+
+std::size_t miniredis::hashtable::get_size () const { return size; }
+
+std::size_t miniredis::hashtable::get_mask () const { return mask; }
+
+void miniredis::hashtable::set_size (std::size_t n) { size = n; }
+
+void miniredis::hashtable::set_mask (std::size_t n) { mask = n; }
+
+void miniredis::hashtable::increment_size () { size++; }
+
+void miniredis::hashtable::decrement_size () { if (size > 0) { size--; } }
+
+void miniredis::hashtable::clear_segment (std::size_t start, std::size_t end)
+{
+  for (std::size_t i = start ; i < end; ++i)
   {
-    return false;
+    if (table[i]) { table[i] = nullptr; }
+  }
+}
+
+void miniredis::hashtable::clear ()
+{
+  std::lock_guard <std::mutex> lock (mutex);
+
+  std::size_t num_threads = std::thread::hardware_concurrency ();
+  std::size_t segment_size = table.size () / num_threads;
+
+  std::vector <std::thread> threads;
+
+  for (std::size_t i = 0; i < num_threads; ++i)
+  {
+    threads.emplace_back ([this, i, segment_size]()
+    {
+      std::size_t start = i * segment_size;
+      std::size_t end = (i + 1) * segment_size;
+      clear_segment (start, end);
+    });
   }
 
-  htab.table.resize (n);
-  htab.mask = n - 1;
-  htab.size = 0;
-
-  return true;
-}
-*/
-std::size_t hashtable::get_size () const
-{
-  return size;
+  for (auto& thread : threads) { thread.join(); }
 }
 
-std::size_t hashtable::get_mask () const
-{
-  return mask;
-}
 
-void hashtable::increment_size ()
-{
-  size++;
-}
-
-void hashtable::decrement_size ()
-{
-  if (size > 0) { size--; }
-}
-
-bool hashtable::compare_nodes (const node_pointer& node, const node_pointer& node2)
+bool miniredis::hashtable::compare_nodes (const node_pointer& node, const node_pointer& node2)
 {
   return node->hashcode == node2->hashcode;
 }
 
-bool hashtable::insert (node_pointer& node)
+bool miniredis::hashtable::insert (node_pointer& node)
 {
   size_t pos = node->hashcode & mask;
 
@@ -62,7 +81,7 @@ bool hashtable::insert (node_pointer& node)
   return true;
 }
 
-bool hashtable::remove (node_pointer& from)
+bool miniredis::hashtable::remove (node_pointer& from)
 {
   if (!from)
   {
@@ -76,7 +95,7 @@ bool hashtable::remove (node_pointer& from)
   return true;
 }
 
-hashtable::node* hashtable::find (const node_pointer& key)
+miniredis::hashtable::node* miniredis::hashtable::find (const node_pointer& key)
 {
   if (table.empty())
   {
@@ -102,53 +121,173 @@ hashtable::node* hashtable::find (const node_pointer& key)
 ******hashmap class*******
 */
 
-bool hashmap::insert (hashtable& hash_table, hashtable::node_pointer node)
+miniredis::hashmap::hashmap () : main (default_size)
 {
-  return true;
+  initialise_main (default_size);
 }
 
-bool hashmap::remove (hashtable& hash_table, hashtable::node_pointer& from)
-{
+bool miniredis::hashmap::power_of_two (std::size_t n) { return (n == 0 || ((n - 1) & n) != 0); }
 
-  return true;
+bool miniredis::hashmap::initialise_main (std::size_t n)
+{
+  if (power_of_two(n))
+  {
+    main.table.resize (n);
+    main.set_mask (n-1);
+    main.set_size (0);
+    return true;
+  }
+
+  return false;
+}
+
+bool miniredis::hashmap::insert (hashtable::node_pointer node)
+{
+  if (!backup_table.get_size ())
+  {
+    //initialise it
+  }
+  main.insert (node);
+
+  if (main.get_size ())
+  {
+    size_t load_factor = main.get_size () / main.get_mask () + 1;
+
+    if (load_factor >= max_nodes_per_resize)
+    {
+      resize_main_table ();
+    }
+  }
+  
+  redistribute_to_backup ();
+}
+
+bool miniredis::hashmap::pop (hashtable::node_pointer& key)
+{
+  redistribute_to_backup ();
+  hashtable::node* from = backup_table.find (key);
+
+  if (from) { return backup_table.remove (key);}
+  
+  from = main.find (key);
+  if (from)
+  {
+    return main.remove (key);
+  }
+
+  return false; //handle error
+}
+
+miniredis::hashtable::node* miniredis::hashmap::find (const hashtable::node_pointer& key)
+{
+  redistribute_to_backup ();
+  //node_pointer *from = &(table[pos]);
+  hashtable::node* found_node = backup_table.find (key);
+
+  if (!found_node)
+  {
+    found_node = main.find (key);
+  }
+
+  
+  return found_node;
 }
 
 
+/*
+when the main table exceeds a certain load capacity,
+we redistribute the nodes in main to the backup and
+clear the main table to free memory.
 
-void hashmap::resize ()
+as the nodes are managed using unique_ptr, they are deleted
+from memory automatically when we clear the table.
+*/
+
+void miniredis::hashmap::redistribute_segment (hashtable& source, hashtable& destination, std::size_t start, std::size_t end)
+{
+  for (std::size_t pos = start; pos < end; ++pos)
+  {
+    hashtable::node_pointer& from = source.table[pos];
+
+    if (!from)
+    {
+      continue;
+    }
+
+    hashtable::node_pointer node = std::move (from);
+    from = std::move (node->next);
+    destination.insert (node);
+  }
+}
+
+void miniredis::hashmap::parallel_redistribute (hashtable& source, hashtable& destination)
+{
+  std::size_t num_threads = std::thread::hardware_concurrency ();
+  std::size_t segment_size = main.get_size () / num_threads;
+  
+  std::vector <std::thread> threads;
+
+  for (std::size_t i = 0; i < num_threads; ++i)
+  {
+    threads.emplace_back ([this, i, segment_size]()
+    {
+      std::size_t start = i * segment_size;
+      std::size_t end = (i + 1) * segment_size;
+      redistribute_segment (main, backup_table, start, end);
+    });
+  }
+
+  for (auto& thread : threads) { thread.join(); }
+}
+
+void miniredis::hashmap::redistribute_to_backup ()
 {
   if (main.table.empty())
   {
     return; //error message
   }
 
-  size_t nodes_moved = 0;
-  while (nodes_moved < max_nodes_per_resize && main.get_size() > 0)
-  {
-    hashtable::node_pointer& from = main.table[resizing_pos];
+  parallel_redistribute (main, backup_table);
 
-    if (!from)
-    {
-      resizing_pos++;
-      continue;
-    }
-
-    hashtable::node_pointer node = std::move (from);
-    from = std::move (node->next);
-    insert (backup, std::move(from));
-    nodes_moved++;
-  }
-
-  if (main.get_size() == 0)
-  {
-    main.table.clear ();
-  }
+  if (main.get_size() == 0) { main.table.clear (); }
 }
 
 
 
-
-hashtable::node* hashmap::find (hashtable& hash_table, const hashtable::node_pointer& key)
+void miniredis::hashmap::check_load_factor ()
 {
-  return nullptr;
+  double load_factor = static_cast <double> (main.get_size () / main.get_mask ());
+
+  if (load_factor >= max_fill_ratio) { resize_main_table(); }
+}
+
+void miniredis::hashmap::adjust_size (std::size_t new_size)
+{
+  if ( power_of_two (new_size))
+  {
+    redistribute_to_backup();
+    initialise_main (new_size);
+    resize_main_table ();
+  }
+}
+
+
+void miniredis::hashmap::resize_main_table ()
+{
+  if (!backup_table.table.empty())
+  {
+    //return error that its not empty.
+  }
+
+  size_t new_size = (main.get_mask () + 1) * 2;
+
+  if (!power_of_two (new_size))
+  {
+    //return error
+  }
+
+  hashtable new_main (new_size);
+  parallel_redistribute (backup_table, new_main);
+  main = std::move (new_main);
+  resizing_pos = 0;
 }
